@@ -2,7 +2,7 @@
 
 Protocol:
 1. Python writes JSON command to C:/temp/autocad_mcp_cmd_{request_id}.json
-2. Python types the fixed string "(c:mcp-dispatch)" + Enter
+2. Python fires "(c:mcp-dispatch)" at AutoCAD over COM (see com_trigger.py)
 3. LISP reads cmd, dispatches via command map, writes result to
    C:/temp/autocad_mcp_result_{request_id}.json
 4. Python polls for result file (100ms intervals, 10s timeout)
@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -21,6 +22,7 @@ from pathlib import Path
 import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
+from autocad_mcp.backends.com_trigger import ComDispatchTrigger
 from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
 
 log = structlog.get_logger()
@@ -29,6 +31,21 @@ log = structlog.get_logger()
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
+
+
+# AutoCAD encodes non-ANSI characters in symbol names as "\U+XXXX" (and the
+# older "\M+NXXXX" MIF form). Both are invalid JSON escapes, so a drawing with,
+# say, a CJK layer name yields a result file that json.loads rejects.
+_ACAD_UNICODE_RE = re.compile(r"\\U\+([0-9A-Fa-f]{4})|\\M\+[0-9]([0-9A-Fa-f]{4})")
+
+
+def repair_lisp_json(text: str) -> str:
+    """Turn AutoCAD's \\U+XXXX / \\M+NXXXX symbol escapes into real characters."""
+
+    def sub(m: re.Match) -> str:
+        return chr(int(m.group(1) or m.group(2), 16))
+
+    return _ACAD_UNICODE_RE.sub(sub, text)
 
 
 def find_autocad_window() -> int | None:
@@ -61,6 +78,7 @@ class FileIPCBackend(AutoCADBackend):
         self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
+        self._trigger: ComDispatchTrigger | None = None
         self._lock = asyncio.Lock()  # Single in-flight command
 
     @property
@@ -106,20 +124,41 @@ class FileIPCBackend(AutoCADBackend):
         # Clean up stale IPC files
         self._cleanup_stale_files()
 
+        # Set up the COM dispatch trigger (and its helper, if we run elevated)
+        self._trigger = ComDispatchTrigger(self._ipc_dir)
+        try:
+            self._trigger.ensure_helper()
+        except Exception as e:
+            log.error("com_helper_start_failed", error=str(e))
+            return CommandResult(
+                ok=False,
+                error=(
+                    f"Could not start the unelevated COM helper: {e}\n"
+                    "The MCP server is running elevated, so it cannot reach AutoCAD "
+                    "directly. Either run the server unelevated, or make sure "
+                    "explorer.exe is running for the interactive user."
+                ),
+            )
+        log.info("dispatch_trigger", **self._trigger.info())
+
         # Ping the dispatcher to verify it's loaded
         result = await self._dispatch("ping", {})
         if not result.ok:
             lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
-            return CommandResult(
-                ok=False,
-                error=(
-                    "AutoCAD LT detected but mcp_dispatch.lsp not loaded.\n"
-                    f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
-                    "Or add lisp-code/ to trusted paths for auto-loading."
-                ),
+            hint = (
+                "AutoCAD detected but the dispatch round-trip failed.\n"
+                f'If mcp_dispatch.lsp is not loaded, type in AutoCAD:\n  (load "{lisp_path}")\n'
+                "Or add lisp-code/ to trusted paths for auto-loading."
             )
+            status = self._trigger.helper_status()
+            if status:
+                hint += f"\nCOM helper status: {status}"
+            return CommandResult(ok=False, error=hint)
 
-        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+        return CommandResult(
+            ok=True,
+            payload={"backend": "file_ipc", "hwnd": self._hwnd, "trigger": self._trigger.info()},
+        )
 
     async def status(self) -> CommandResult:
         info = {
@@ -128,6 +167,11 @@ class FileIPCBackend(AutoCADBackend):
             "ipc_dir": str(self._ipc_dir),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
         }
+        if self._trigger is not None:
+            info["trigger"] = self._trigger.info()
+            status = self._trigger.helper_status()
+            if status:
+                info["helper_status"] = status
         return CommandResult(ok=True, payload=info)
 
     # --- IPC dispatch ---
@@ -162,6 +206,8 @@ class FileIPCBackend(AutoCADBackend):
 
             # Poll for result
             deadline = time.time() + TIMEOUT
+            parse_error: str | None = None
+            parse_attempts = 0
             while time.time() < deadline:
                 if result_file.exists():
                     try:
@@ -171,7 +217,10 @@ class FileIPCBackend(AutoCADBackend):
                             text = result_file.read_text(encoding="utf-8")
                         except UnicodeDecodeError:
                             text = result_file.read_text(encoding="cp1252")
-                        data = json.loads(text)
+                        try:
+                            data = json.loads(text)
+                        except json.JSONDecodeError:
+                            data = json.loads(repair_lisp_json(text))
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
                             return CommandResult(
@@ -179,8 +228,24 @@ class FileIPCBackend(AutoCADBackend):
                                 payload=data.get("payload"),
                                 error=data.get("error"),
                             )
-                    except (json.JSONDecodeError, OSError):
-                        pass  # File may be partially written, retry
+                    except OSError:
+                        pass  # File may be mid-rename, retry
+                    except json.JSONDecodeError as e:
+                        # The rename is atomic, so a present file is complete:
+                        # a few retries cover the edge case, then we report the
+                        # real problem instead of silently burning the timeout.
+                        parse_error = str(e)
+                        parse_attempts += 1
+                        if parse_attempts >= 3:
+                            log.error("result_parse_failed", request_id=request_id, error=parse_error)
+                            return CommandResult(
+                                ok=False,
+                                error=(
+                                    f"AutoCAD returned malformed JSON for '{command}': {parse_error}. "
+                                    "This usually means a symbol name in the drawing contains "
+                                    "characters the LISP serializer does not escape."
+                                ),
+                            )
                 await asyncio.sleep(POLL_INTERVAL)
 
             return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
@@ -214,34 +279,19 @@ class FileIPCBackend(AutoCADBackend):
             return None
 
     def _type_dispatch_trigger(self):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+        """Fire '(c:mcp-dispatch)' at AutoCAD via COM.
 
-        Sends ESC keystrokes first to cancel any stale pending command
-        (e.g. from a previous timeout leaving AutoCAD in a command prompt).
+        The former approach — posting WM_CHAR to the MDIClient — is a no-op on
+        AutoCAD 2024+, where the command line is a WPF control that never
+        receives synthesized character messages. See com_trigger.py.
         """
+        if self._trigger is None:
+            log.error("dispatch_trigger_unavailable")
+            return
         try:
-            import ctypes
-
-            WM_CHAR = 0x0102
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            VK_ESCAPE = 0x1B
-            target = self._command_hwnd or self._hwnd
-            post = ctypes.windll.user32.PostMessageW
-
-            # Cancel any pending command (2x ESC for nested commands)
-            for _ in range(2):
-                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                post(target, WM_KEYUP, VK_ESCAPE, 0)
-            time.sleep(0.05)
-
-            for ch in "(c:mcp-dispatch)":
-                post(target, WM_CHAR, ord(ch), 0)
-            # Enter = carriage return
-            post(target, WM_CHAR, 0x0D, 0)
-            time.sleep(0.05)
+            self._trigger.fire()
         except Exception as e:
-            log.error("dispatch_trigger_failed", error=str(e))
+            log.error("dispatch_trigger_failed", error=str(e), mode=self._trigger.mode)
 
     def _cleanup_stale_files(self):
         """Remove stale IPC files from previous sessions."""

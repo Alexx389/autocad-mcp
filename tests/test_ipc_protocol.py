@@ -536,3 +536,48 @@ class TestVariableNameStripping:
         names = None
         names_str = "" if not names else ";".join(names)
         assert names_str == ""
+
+
+# ---------------------------------------------------------------------------
+# AutoCAD symbol-name escapes in result JSON
+# ---------------------------------------------------------------------------
+
+
+class TestRepairLispJson:
+    """AutoCAD writes non-ANSI symbol names as \\U+XXXX, which is invalid JSON.
+
+    A drawing with, say, a CJK layer name used to make every command time out:
+    the result file arrived fine but json.loads rejected it, and the poll loop
+    swallowed the error and kept waiting.
+    """
+
+    def test_unicode_escape_becomes_character(self):
+        from autocad_mcp.backends.file_ipc import repair_lisp_json
+
+        assert repair_lisp_json(r"\U+586B\U+5145") == "填充"
+
+    def test_mif_escape_becomes_character(self):
+        from autocad_mcp.backends.file_ipc import repair_lisp_json
+
+        assert repair_lisp_json(r"\M+15145") == "充"
+
+    def test_repaired_payload_parses(self):
+        from autocad_mcp.backends.file_ipc import repair_lisp_json
+
+        raw = r'{"ok": true, "payload": {"layers": ["0", "\U+586B\U+5145"]}}'
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)
+        assert json.loads(repair_lisp_json(raw))["payload"]["layers"][1] == "填充"
+
+    def test_plain_json_untouched(self):
+        from autocad_mcp.backends.file_ipc import repair_lisp_json
+
+        raw = '{"ok": true, "payload": {"layers": ["0", "MUROS"]}}'
+        assert repair_lisp_json(raw) == raw
+
+    def test_valid_escapes_preserved(self):
+        """Legitimate JSON escapes must survive the repair pass."""
+        from autocad_mcp.backends.file_ipc import repair_lisp_json
+
+        raw = r'{"name": "a\"b\\c\nd"}'
+        assert json.loads(repair_lisp_json(raw))["name"] == 'a"b\\c\nd'
